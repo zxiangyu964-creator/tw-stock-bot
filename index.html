@@ -950,59 +950,89 @@ async function fetchWithTimeout(url, timeoutMs = 5000) {
 }
 
 async function fetchOneLivePrice(code) {
-  // 如果配置了 GAS，直接通過 GAS 查詢（避免 CORS 問題）
-  if(gasUrl) {
-    try {
-      const res = await fetchWithTimeout(gasUrl + '?action=getPrice&code=' + code, 5000);
-      if(res.ok) {
-        const d = await res.json();
-        if(d.price && d.price > 0) return d.price;
-      }
-    } catch(e) {
-      console.debug(`GAS查詢失敗 ${code}`);
-    }
-  }
-
-  // 備用方案1：Yahoo Finance（支持 CORS）
-  try {
-    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=1d`;
-    const res = await fetchWithTimeout(yahooUrl, 5000);
-    if(res.ok) {
-      const data = await res.json();
-      const price = data.chart?.result?.[0]?.meta?.regularMarketPrice;
-      if(price && price > 0) return parseFloat(price);
-    }
-  } catch(e) {
-    console.debug(`Yahoo查詢失敗 ${code}`);
-  }
-
-  // 備用方案2：台灣證券交易所 API（TSE - 可能有 CORS 限制）
+  // 方案1：TWSE 官方 API - 即時報價
   try {
     const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
-    const res = await fetchWithTimeout(tseUrl, 5000);
+    const res = await fetchWithTimeout(tseUrl, 8000);
     if(res.ok) {
       const d = await res.json();
-      const z = d.msgArray?.[0]?.z;
-      if(z && z !== '-' && parseFloat(z) > 0) return parseFloat(z);
+      if(d.msgArray && d.msgArray.length > 0) {
+        const z = d.msgArray[0].z;
+        if(z && z !== '-' && z !== '') {
+          const price = parseFloat(z);
+          if(price > 0) {
+            console.log(`✓ TSE查詢成功: ${code} = ${price}`);
+            return price;
+          }
+        }
+      }
     }
   } catch(e) {
-    console.debug(`TSE查詢失敗 ${code}`);
+    console.debug(`TSE查詢失敗 ${code}:`, e.message);
   }
-  
-  // 備用方案3：OTC（櫃檯 - 可能有 CORS 限制）
+
+  // 方案2：TPEX OTC - 即時報價
   try {
     const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
-    const res = await fetchWithTimeout(otcUrl, 5000);
+    const res = await fetchWithTimeout(otcUrl, 8000);
     if(res.ok) {
       const d = await res.json();
-      const z = d.msgArray?.[0]?.z;
-      if(z && z !== '-' && parseFloat(z) > 0) return parseFloat(z);
+      if(d.msgArray && d.msgArray.length > 0) {
+        const z = d.msgArray[0].z;
+        if(z && z !== '-' && z !== '') {
+          const price = parseFloat(z);
+          if(price > 0) {
+            console.log(`✓ OTC查詢成功: ${code} = ${price}`);
+            return price;
+          }
+        }
+      }
     }
   } catch(e) {
-    console.debug(`OTC查詢失敗 ${code}`);
+    console.debug(`OTC查詢失敗 ${code}:`, e.message);
   }
-  
-  console.warn(`查詢失敗: ${code}`);
+
+  // 方案3：使用 TWSE 列表 API
+  try {
+    const listUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw|otc_${code}.tw`;
+    const res = await fetchWithTimeout(listUrl, 8000);
+    if(res.ok) {
+      const d = await res.json();
+      if(d.msgArray && d.msgArray.length > 0) {
+        for(let item of d.msgArray) {
+          if(item.z && item.z !== '-' && item.z !== '') {
+            const price = parseFloat(item.z);
+            if(price > 0) {
+              console.log(`✓ 列表查詢成功: ${code} = ${price}`);
+              return price;
+            }
+          }
+        }
+      }
+    }
+  } catch(e) {
+    console.debug(`列表查詢失敗 ${code}:`, e.message);
+  }
+
+  // 方案4：備用 API - Finmind（可能延遲，但較穩定）
+  try {
+    const finUrl = `https://api.finmind.com.tw/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&end_date=2099-12-31&limit=1`;
+    const res = await fetchWithTimeout(finUrl, 8000);
+    if(res.ok) {
+      const d = await res.json();
+      if(d.data && d.data.length > 0) {
+        const price = parseFloat(d.data[0]?.close);
+        if(price && price > 0) {
+          console.log(`✓ Finmind查詢成功: ${code} = ${price}`);
+          return price;
+        }
+      }
+    }
+  } catch(e) {
+    console.debug(`Finmind查詢失敗 ${code}:`, e.message);
+  }
+
+  console.warn(`❌ 無法查詢: ${code} - 所有方案均失敗`);
   return null;
 }
 
@@ -1014,10 +1044,13 @@ async function fetchLivePrices() {
   showLoading(`更新現價中... 0/${codes.length}`);
   showProgress(0, codes.length);
 
-  const BATCH = 5;       // 每批並列數
-  const DELAY_MS = 80;   // 批次間隔（ms），避免觸發 rate limit
+  const BATCH = 3;       // 每批並列數（減少併發避免被限制）
+  const DELAY_MS = 200;   // 批次間隔（ms），避免觸發 rate limit
   let updated = 0;
+  let failed = [];
   let done = 0;
+
+  console.log(`開始查詢 ${codes.length} 檔股票現價...`);
 
   for(let i = 0; i < codes.length; i += BATCH) {
     const batch = codes.slice(i, i + BATCH);
@@ -1025,13 +1058,24 @@ async function fetchLivePrices() {
     // 同批並列執行，任一失敗不影響其他
     const results = await Promise.allSettled(
       batch.map(async code => {
-        const price = await fetchOneLivePrice(code);
-        if(price !== null) { livePrices[code] = price; updated++; }
+        try {
+          const price = await fetchOneLivePrice(code);
+          if(price !== null) { 
+            livePrices[code] = price; 
+            updated++; 
+          } else {
+            failed.push(code);
+          }
+        } catch(e) {
+          failed.push(code);
+          console.error(`查詢異常 ${code}:`, e.message);
+        }
       })
     );
 
     done = Math.min(i + BATCH, codes.length);
     showProgress(done, codes.length);
+    document.getElementById('loadingText').textContent = `更新現價中... ${done}/${codes.length} (成功: ${updated})`;
 
     // 批次間短暫等待，最後一批不需要
     if(i + BATCH < codes.length) {
@@ -1042,7 +1086,15 @@ async function fetchLivePrices() {
   livePriceTimestamp = Date.now();
   hideProgress();
   hideLoading();
-  showToast('已更新 ' + updated + '/' + codes.length + ' 檔現價', updated > 0 ? 'ok' : 'fail');
+  
+  console.log(`查詢完成: 成功${updated}檔，失敗${failed.length}檔`);
+  if(failed.length > 0) {
+    console.debug(`失敗的股票:`, failed.join(', '));
+  }
+  
+  const msg = updated > 0 ? `已更新 ${updated}/${codes.length} 檔現價` : '現價查詢失敗，請檢查網路';
+  showToast(msg, updated > 0 ? 'ok' : 'fail');
+  
   renderPerf();
   renderLedger();
 }
@@ -1056,23 +1108,36 @@ async function fetchLivePricesForLedger() {
   showLoading(`更新 ${codes.length} 檔現價...`);
   showProgress(0, codes.length);
 
-  const BATCH = 5;
-  const DELAY_MS = 80;
+  const BATCH = 3;
+  const DELAY_MS = 200;
   let updated = 0;
+  let failed = [];
   let done = 0;
+
+  console.log(`開始查詢帳本 ${codes.length} 檔股票現價...`);
 
   for(let i = 0; i < codes.length; i += BATCH) {
     const batch = codes.slice(i, i + BATCH);
 
     await Promise.allSettled(
       batch.map(async code => {
-        const price = await fetchOneLivePrice(code);
-        if(price !== null) { livePrices[code] = price; updated++; }
+        try {
+          const price = await fetchOneLivePrice(code);
+          if(price !== null) { 
+            livePrices[code] = price; 
+            updated++; 
+          } else {
+            failed.push(code);
+          }
+        } catch(e) {
+          failed.push(code);
+        }
       })
     );
 
     done = Math.min(i + BATCH, codes.length);
     showProgress(done, codes.length);
+    document.getElementById('loadingText').textContent = `更新現價中... ${done}/${codes.length} (成功: ${updated})`;
 
     if(i + BATCH < codes.length) {
       await new Promise(r => setTimeout(r, DELAY_MS));
@@ -1082,7 +1147,10 @@ async function fetchLivePricesForLedger() {
   livePriceTimestamp = Date.now();
   hideProgress();
   hideLoading();
-  showToast('已更新 ' + updated + '/' + codes.length + ' 檔現價', updated > 0 ? 'ok' : 'fail');
+  
+  console.log(`帳本查詢完成: 成功${updated}檔，失敗${failed.length}檔`);
+  const msg = updated > 0 ? `已更新 ${updated}/${codes.length} 檔現價` : '現價查詢失敗，請檢查網路';
+  showToast(msg, updated > 0 ? 'ok' : 'fail');
   renderLedger();
 }
 
