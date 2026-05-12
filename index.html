@@ -306,6 +306,7 @@ tbody td{padding:8px 12px;vertical-align:middle;}
     </div>
 
     <button class="btn ghost" onclick="fetchLivePricesForLedger()">🔄 更新現價</button>
+    <button class="btn ghost" onclick="openManualPriceModal()">✏️ 手動編輯現價</button>
     <button class="btn ghost" onclick="loadLedgerFromGAS()">☁️ 從GAS載入</button>
     <button class="btn ghost" onclick="openAddManual()">＋ 手動新增</button>
   </div>
@@ -451,6 +452,20 @@ tbody td{padding:8px 12px;vertical-align:middle;}
     <div class="modal-actions">
       <button class="btn ghost" onclick="document.getElementById('addLedgerModal').classList.remove('open')">取消</button>
       <button class="btn green" onclick="submitAddLedger()">新增帳本</button>
+    </div>
+  </div>
+</div>
+
+<!-- MANUAL PRICE EDIT MODAL -->
+<div class="modal-bg" id="manualPriceModal">
+  <div class="modal" style="max-width:600px;">
+    <h3>✏️ 手動編輯現價</h3>
+    <p style="font-size:11px;color:var(--text3);margin-bottom:12px;">在下方輸入股票代號和價格。格式: 代號=價格，每行一筆。(例: 2330=800)</p>
+    <textarea id="manualPriceInput" style="width:100%;height:200px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;padding:8px;border-radius:var(--r);outline:none;resize:vertical;" placeholder="2330=800&#10;2317=250&#10;1234=500"></textarea>
+    <div id="manualPriceStatus" style="margin-top:8px;font-size:12px;color:var(--text3);"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="document.getElementById('manualPriceModal').classList.remove('open')">取消</button>
+      <button class="btn green" onclick="applyManualPrices()">套用現價</button>
     </div>
   </div>
 </div>
@@ -913,6 +928,68 @@ function submitAddLedger() {
   showToast('已新增 '+nd+' 帳本','ok');
 }
 
+function openManualPriceModal() {
+  document.getElementById('manualPriceInput').value = '';
+  document.getElementById('manualPriceStatus').textContent = '';
+  document.getElementById('manualPriceModal').classList.add('open');
+}
+
+function applyManualPrices() {
+  const input = document.getElementById('manualPriceInput').value.trim();
+  const status = document.getElementById('manualPriceStatus');
+  
+  if(!input) {
+    status.textContent = '❌ 請輸入價格數據';
+    status.style.color = 'var(--red)';
+    return;
+  }
+  
+  const lines = input.split('\n').filter(l => l.trim());
+  let success = 0, failed = 0;
+  const failedLines = [];
+  
+  lines.forEach(line => {
+    const parts = line.split('=').map(s => s.trim());
+    if(parts.length !== 2) {
+      failed++;
+      failedLines.push(line);
+      return;
+    }
+    
+    const [code, priceStr] = parts;
+    const price = parseFloat(priceStr);
+    
+    if(!code || isNaN(price) || price <= 0) {
+      failed++;
+      failedLines.push(line);
+      return;
+    }
+    
+    livePrices[code] = price;
+    console.log(`✓ 手動輸入: ${code} = ${price}`);
+    success++;
+  });
+  
+  if(success > 0) {
+    status.textContent = `✓ 成功套用 ${success} 筆現價`;
+    status.style.color = 'var(--green)';
+    livePriceTimestamp = Date.now();
+    renderPerf();
+    renderLedger();
+    setTimeout(() => {
+      document.getElementById('manualPriceModal').classList.remove('open');
+      showToast(`已手動輸入 ${success} 筆現價`, 'ok');
+    }, 800);
+  } else {
+    status.textContent = `❌ 全部輸入有誤`;
+    status.style.color = 'var(--red)';
+  }
+  
+  if(failed > 0) {
+    console.warn(`有 ${failed} 行格式錯誤:`, failedLines);
+  }
+}
+
 // ============================================================
 // LIVE PRICE UPDATE - 批量並列抓取 (BATCH PARALLEL - 方案A)
 // 原本：逐檔串列 + 120ms 延遲 → 50檔約 6秒以上
@@ -936,11 +1013,11 @@ function hideProgress() {
   if(bar) bar.style.width = '0%';
 }
 
-async function fetchWithTimeout(url, timeoutMs = 5000) {
+async function fetchWithTimeout(url, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {signal: controller.signal});
+    const res = await fetch(url, {signal: controller.signal, headers: {'Accept': 'application/json'}});
     clearTimeout(timeoutId);
     return res;
   } catch(e) {
@@ -950,89 +1027,46 @@ async function fetchWithTimeout(url, timeoutMs = 5000) {
 }
 
 async function fetchOneLivePrice(code) {
-  // 方案1：TWSE 官方 API - 即時報價
-  try {
-    const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
-    const res = await fetchWithTimeout(tseUrl, 8000);
-    if(res.ok) {
-      const d = await res.json();
-      if(d.msgArray && d.msgArray.length > 0) {
-        const z = d.msgArray[0].z;
-        if(z && z !== '-' && z !== '') {
-          const price = parseFloat(z);
-          if(price > 0) {
-            console.log(`✓ TSE查詢成功: ${code} = ${price}`);
-            return price;
-          }
-        }
+  console.log(`🔍 開始查詢: ${code}`);
+  
+  // 嘗試查詢 TWSE/OTC API
+  for(let attempt = 0; attempt < 2; attempt++) {
+    const isOTC = attempt === 1;
+    const exchange = isOTC ? 'otc' : 'tse';
+    const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=5&ex_ch=${exchange}_${code}.tw`;
+    
+    try {
+      console.debug(`  [${attempt + 1}/2] 嘗試 ${exchange.toUpperCase()} API...`);
+      const res = await fetchWithTimeout(url, 10000);
+      
+      if(!res.ok) {
+        console.debug(`  ✗ HTTP ${res.status}`);
+        continue;
       }
-    }
-  } catch(e) {
-    console.debug(`TSE查詢失敗 ${code}:`, e.message);
-  }
-
-  // 方案2：TPEX OTC - 即時報價
-  try {
-    const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
-    const res = await fetchWithTimeout(otcUrl, 8000);
-    if(res.ok) {
+      
       const d = await res.json();
-      if(d.msgArray && d.msgArray.length > 0) {
-        const z = d.msgArray[0].z;
-        if(z && z !== '-' && z !== '') {
-          const price = parseFloat(z);
-          if(price > 0) {
-            console.log(`✓ OTC查詢成功: ${code} = ${price}`);
-            return price;
-          }
-        }
+      
+      if(!d.msgArray || d.msgArray.length === 0) {
+        console.debug(`  ✗ 無資料`);
+        continue;
       }
-    }
-  } catch(e) {
-    console.debug(`OTC查詢失敗 ${code}:`, e.message);
-  }
-
-  // 方案3：使用 TWSE 列表 API
-  try {
-    const listUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw|otc_${code}.tw`;
-    const res = await fetchWithTimeout(listUrl, 8000);
-    if(res.ok) {
-      const d = await res.json();
-      if(d.msgArray && d.msgArray.length > 0) {
-        for(let item of d.msgArray) {
-          if(item.z && item.z !== '-' && item.z !== '') {
-            const price = parseFloat(item.z);
-            if(price > 0) {
-              console.log(`✓ 列表查詢成功: ${code} = ${price}`);
-              return price;
-            }
-          }
-        }
-      }
-    }
-  } catch(e) {
-    console.debug(`列表查詢失敗 ${code}:`, e.message);
-  }
-
-  // 方案4：備用 API - Finmind（可能延遲，但較穩定）
-  try {
-    const finUrl = `https://api.finmind.com.tw/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&end_date=2099-12-31&limit=1`;
-    const res = await fetchWithTimeout(finUrl, 8000);
-    if(res.ok) {
-      const d = await res.json();
-      if(d.data && d.data.length > 0) {
-        const price = parseFloat(d.data[0]?.close);
-        if(price && price > 0) {
-          console.log(`✓ Finmind查詢成功: ${code} = ${price}`);
+      
+      const z = d.msgArray[0].z;
+      if(z && z !== '-' && z !== '') {
+        const price = parseFloat(z);
+        if(price > 0) {
+          console.log(`  ✓ ${exchange.toUpperCase()} 查詢成功: ${code} = ${price}`);
           return price;
         }
       }
+      console.debug(`  ✗ 價格無效: ${z}`);
+      
+    } catch(e) {
+      console.debug(`  ✗ ${exchange.toUpperCase()} 錯誤: ${e.message}`);
     }
-  } catch(e) {
-    console.debug(`Finmind查詢失敗 ${code}:`, e.message);
   }
-
-  console.warn(`❌ 無法查詢: ${code} - 所有方案均失敗`);
+  
+  console.warn(`❌ 無法查詢 ${code} - TWSE API 失敗，使用本地緩存價格`);
   return null;
 }
 
@@ -1044,18 +1078,17 @@ async function fetchLivePrices() {
   showLoading(`更新現價中... 0/${codes.length}`);
   showProgress(0, codes.length);
 
-  const BATCH = 3;       // 每批並列數（減少併發避免被限制）
-  const DELAY_MS = 200;   // 批次間隔（ms），避免觸發 rate limit
+  const BATCH = 2;       // 每批只查 2 檔
+  const DELAY_MS = 500;   // 批次間隔增加到 500ms
   let updated = 0;
   let failed = [];
   let done = 0;
 
-  console.log(`開始查詢 ${codes.length} 檔股票現價...`);
+  console.log(`=== 開始查詢 ${codes.length} 檔股票現價 ===`);
 
   for(let i = 0; i < codes.length; i += BATCH) {
     const batch = codes.slice(i, i + BATCH);
 
-    // 同批並列執行，任一失敗不影響其他
     const results = await Promise.allSettled(
       batch.map(async code => {
         try {
@@ -1077,7 +1110,6 @@ async function fetchLivePrices() {
     showProgress(done, codes.length);
     document.getElementById('loadingText').textContent = `更新現價中... ${done}/${codes.length} (成功: ${updated})`;
 
-    // 批次間短暫等待，最後一批不需要
     if(i + BATCH < codes.length) {
       await new Promise(r => setTimeout(r, DELAY_MS));
     }
@@ -1087,14 +1119,21 @@ async function fetchLivePrices() {
   hideProgress();
   hideLoading();
   
-  console.log(`查詢完成: 成功${updated}檔，失敗${failed.length}檔`);
+  console.log(`=== 查詢完成: 成功 ${updated}/${codes.length} 檔 ===`);
   if(failed.length > 0) {
-    console.debug(`失敗的股票:`, failed.join(', '));
+    console.warn(`失敗股票 (${failed.length}): `, failed.join(', '));
   }
   
-  const msg = updated > 0 ? `已更新 ${updated}/${codes.length} 檔現價` : '現價查詢失敗，請檢查網路';
-  showToast(msg, updated > 0 ? 'ok' : 'fail');
+  let msg;
+  if(updated === codes.length) {
+    msg = `✓ 全部 ${updated} 檔現價更新成功`;
+  } else if(updated > 0) {
+    msg = `⚠️ 部分成功: ${updated}/${codes.length} 檔更新 (${failed.length}檔失敗)`;
+  } else {
+    msg = `✗ 現價查詢全部失敗，請檢查網路連線或手動輸入`;
+  }
   
+  showToast(msg, updated > 0 ? 'ok' : 'fail');
   renderPerf();
   renderLedger();
 }
