@@ -936,44 +936,73 @@ function hideProgress() {
   if(bar) bar.style.width = '0%';
 }
 
+async function fetchWithTimeout(url, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {signal: controller.signal});
+    clearTimeout(timeoutId);
+    return res;
+  } catch(e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
 async function fetchOneLivePrice(code) {
-  // 直接調用外部 API - 支援多個 API 來源
-  
-  // 方案1：台灣證券交易所 API
-  try {
-    const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
-    let res = await fetch(tseUrl, {timeout: 5000});
-    let d = await res.json();
-    let z = d.msgArray?.[0]?.z;
-    if(z && z !== '-' && z) return parseFloat(z);
-  } catch(e) {
-    console.debug(`TSE查詢失敗 ${code}:`, e.message);
+  // 如果配置了 GAS，直接通過 GAS 查詢（避免 CORS 問題）
+  if(gasUrl) {
+    try {
+      const res = await fetchWithTimeout(gasUrl + '?action=getPrice&code=' + code, 5000);
+      if(res.ok) {
+        const d = await res.json();
+        if(d.price && d.price > 0) return d.price;
+      }
+    } catch(e) {
+      console.debug(`GAS查詢失敗 ${code}`);
+    }
   }
-  
-  // 方案2：OTC（櫃檯）
+
+  // 備用方案1：Yahoo Finance（支持 CORS）
   try {
-    const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
-    let res = await fetch(otcUrl, {timeout: 5000});
-    let d = await res.json();
-    let z = d.msgArray?.[0]?.z;
-    if(z && z !== '-' && z) return parseFloat(z);
-  } catch(e) {
-    console.debug(`OTC查詢失敗 ${code}:`, e.message);
-  }
-  
-  // 方案3：備用 API（Finmind）
-  try {
-    const finUrl = `https://api.finmind.com.tw/api/v3/data?dataset=TaiwanStockPrice&data_id=${code}&end_date=2099-12-31&token=&limit=1`;
-    let res = await fetch(finUrl, {timeout: 5000});
-    let d = await res.json();
-    if(d.data?.length > 0) {
-      const price = d.data[0]?.close;
-      if(price) return parseFloat(price);
+    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${code}.TW?interval=1d&range=1d`;
+    const res = await fetchWithTimeout(yahooUrl, 5000);
+    if(res.ok) {
+      const data = await res.json();
+      const price = data.chart?.result?.[0]?.meta?.regularMarketPrice;
+      if(price && price > 0) return parseFloat(price);
     }
   } catch(e) {
-    console.debug(`Finmind查詢失敗 ${code}:`, e.message);
+    console.debug(`Yahoo查詢失敗 ${code}`);
+  }
+
+  // 備用方案2：台灣證券交易所 API（TSE - 可能有 CORS 限制）
+  try {
+    const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
+    const res = await fetchWithTimeout(tseUrl, 5000);
+    if(res.ok) {
+      const d = await res.json();
+      const z = d.msgArray?.[0]?.z;
+      if(z && z !== '-' && parseFloat(z) > 0) return parseFloat(z);
+    }
+  } catch(e) {
+    console.debug(`TSE查詢失敗 ${code}`);
   }
   
+  // 備用方案3：OTC（櫃檯 - 可能有 CORS 限制）
+  try {
+    const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
+    const res = await fetchWithTimeout(otcUrl, 5000);
+    if(res.ok) {
+      const d = await res.json();
+      const z = d.msgArray?.[0]?.z;
+      if(z && z !== '-' && parseFloat(z) > 0) return parseFloat(z);
+    }
+  } catch(e) {
+    console.debug(`OTC查詢失敗 ${code}`);
+  }
+  
+  console.warn(`查詢失敗: ${code}`);
   return null;
 }
 
@@ -1614,7 +1643,7 @@ function normalizeUploadRows(rows) {
 // ============================================================
 function renderGASCode() {
   document.getElementById('gasCode').value = `// ====== 台股績效系統 GAS 後端 ======
-// GAS只負責管理帳務本和績效
+// GAS 負責：帳務本管理 + 現價查詢
 const LEDGER_SHEET = '帳務本';
 const PRICES_SHEET = '每日現價';
 
@@ -1622,6 +1651,7 @@ function doGet(e) {
   const a = e.parameter.action;
   if (a === 'ping') return json({status:'ok', time: new Date().toISOString()});
   if (a === 'getLedger') return json({data: readLedger()});
+  if (a === 'getPrice') return json({price: getLivePrice(e.parameter.code)});
   if (a === 'getPrices') return json({data: readPrices(e.parameter.date)});
   return json({error:'unknown action'});
 }
@@ -1639,6 +1669,32 @@ function doPost(e) {
 
 function json(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// 查詢單檔股票現價（通過台灣證券交易所 API）
+function getLivePrice(code) {
+  try {
+    const tseUrl = \`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_\${code}.tw\`;
+    const res = UrlFetchApp.fetch(tseUrl, {muteHttpExceptions: true});
+    if (res.getResponseCode() === 200) {
+      const data = JSON.parse(res.getContentText());
+      const z = data.msgArray?.[0]?.z;
+      if (z && z !== '-') return parseFloat(z);
+    }
+  } catch(e) {}
+  
+  // 如果 TSE 失敗，嘗試 OTC
+  try {
+    const otcUrl = \`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_\${code}.tw\`;
+    const res = UrlFetchApp.fetch(otcUrl, {muteHttpExceptions: true});
+    if (res.getResponseCode() === 200) {
+      const data = JSON.parse(res.getContentText());
+      const z = data.msgArray?.[0]?.z;
+      if (z && z !== '-') return parseFloat(z);
+    }
+  } catch(e) {}
+  
+  return null;
 }
 
 function getSheet(name, headers) {
