@@ -263,10 +263,13 @@ tbody td{padding:8px 12px;vertical-align:middle;}
 
 <!-- LEDGER PAGE -->
 <div class="page" id="page-ledger">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
-    <div class="ledger-tabs" id="ledgerTabs"></div>
-    <button class="btn ghost" style="font-size:18px;padding:4px 12px;" onclick="openAddLedgerModal()" title="新增帳本">＋</button>
-  </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+      <label style="font-size:12px;color:var(--text2);">選取帳務本：</label>
+      <select id="ledgerSelector" onchange="switchLedgerBySelect()" style="background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:inherit;font-size:13px;padding:7px 10px;border-radius:var(--r);outline:none;">
+        <option value="">-- 選擇帳務本 --</option>
+      </select>
+      <div class="ledger-tabs" id="ledgerTabs" style="flex:1;"></div>
+    </div>
 
   <div class="toolbar">
     <div class="period-tabs">
@@ -346,22 +349,21 @@ tbody td{padding:8px 12px;vertical-align:middle;}
 <div class="page" id="page-settings">
   <div class="gas-panel">
     <h3>🔗 Google Apps Script 設定</h3>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:14px;">部署 GAS 為網頁應用程式後，將 URL 貼入此處。執行身分選「以我的身份」，存取權選「任何人」。</p>
+    <p style="font-size:12px;color:var(--text3);margin-bottom:14px;">GAS 只負責管理帳務本。部署 GAS 為網頁應用程式後，將 URL 貼入此處。執行身分選「以我的身份」，存取權選「任何人」。<br/>股票數據現已改為本地上傳。</p>
     <div class="gas-row">
       <input class="gas-input" id="gasUrl" placeholder="https://script.google.com/macros/s/xxxx/exec">
       <div class="status-dot" id="gasStatus"></div>
       <button class="btn ghost" onclick="testGAS()">測試</button>
       <button class="btn" onclick="saveGASUrl()">儲存</button>
-      <button class="btn ghost" onclick="loadStocksFromGAS()">📊 載入股票數據</button>
     </div>
   </div>
 
   <div class="gas-panel">
     <h3>📁 上傳股票數據檔案</h3>
-    <p style="font-size:12px;color:var(--text3);margin-bottom:14px;">上傳掃描出的股票數據檔案（JSON / CSV / XLSX），系統會自動解析並更新到試算表。</p>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:14px;">上傳股票數據檔案（JSON / CSV / XLSX），系統會在本地HTML中載入。<br/>注意：股票數據僅保存在本地瀏覽器，需要定期備份。</p>
     <div class="gas-row">
       <input type="file" id="dataFile" accept=".json,.csv,.xls,.xlsx" style="flex:1;">
-      <button class="btn" onclick="uploadDataFile()">📤 上傳並更新</button>
+      <button class="btn" onclick="uploadDataFile()">📤 上傳股票</button>
     </div>
     <div id="uploadStatus" style="margin-top:10px;font-size:12px;color:var(--text3);"></div>
   </div>
@@ -370,6 +372,7 @@ tbody td{padding:8px 12px;vertical-align:middle;}
     <h3>🗑️ 清除快取</h3>
     <div class="gas-row">
       <button class="btn red" onclick="clearCache()">🗑️ 清除所有快取</button>
+      <button class="btn red" onclick="clearAllStocks()">🗑️ 清除所有股票</button>
     </div>
   </div>
 
@@ -530,7 +533,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if(gasUrl) {
     loadLedgerFromGAS(true);
-    loadStocksFromGAS(true);
   }
 
   document.addEventListener('click', e => {
@@ -591,11 +593,24 @@ function renderLedgerTabs() {
     </button>`;
   }).join('');
 
+  // 更新下拉菜單
+  const sel = document.getElementById('ledgerSelector');
+  if(sel) {
+    sel.innerHTML = '<option value="">-- 選擇帳務本 --' + 
+      dates.map(d => `<option value="${d}" ${d===currentLedgerDate?'selected':''}>${formatDateLabel(d)}</option>`).join('');
+    sel.value = currentLedgerDate;
+  }
+
   const cl = document.getElementById('chartLedger');
   if(cl) {
     cl.innerHTML = '<option value="all">全部帳本</option>' +
       dates.map(d => `<option value="${d}">${formatDateLabel(d)}</option>`).join('');
   }
+}
+
+function switchLedgerBySelect() {
+  const d = document.getElementById('ledgerSelector').value;
+  if(d) switchLedger(d);
 }
 
 function formatDateLabel(d) {
@@ -922,20 +937,43 @@ function hideProgress() {
 }
 
 async function fetchOneLivePrice(code) {
-  // Try TSE first, fallback to OTC
-  const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
-  const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
+  // 直接調用外部 API - 支援多個 API 來源
+  
+  // 方案1：台灣證券交易所 API
   try {
-    let res = await fetch(tseUrl);
+    const tseUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=tse_${code}.tw`;
+    let res = await fetch(tseUrl, {timeout: 5000});
     let d = await res.json();
     let z = d.msgArray?.[0]?.z;
-    if(z && z !== '-') return parseFloat(z);
-    // Try OTC
-    res = await fetch(otcUrl);
-    d = await res.json();
-    z = d.msgArray?.[0]?.z;
-    if(z && z !== '-') return parseFloat(z);
-  } catch(e) {}
+    if(z && z !== '-' && z) return parseFloat(z);
+  } catch(e) {
+    console.debug(`TSE查詢失敗 ${code}:`, e.message);
+  }
+  
+  // 方案2：OTC（櫃檯）
+  try {
+    const otcUrl = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=otc_${code}.tw`;
+    let res = await fetch(otcUrl, {timeout: 5000});
+    let d = await res.json();
+    let z = d.msgArray?.[0]?.z;
+    if(z && z !== '-' && z) return parseFloat(z);
+  } catch(e) {
+    console.debug(`OTC查詢失敗 ${code}:`, e.message);
+  }
+  
+  // 方案3：備用 API（Finmind）
+  try {
+    const finUrl = `https://api.finmind.com.tw/api/v3/data?dataset=TaiwanStockPrice&data_id=${code}&end_date=2099-12-31&token=&limit=1`;
+    let res = await fetch(finUrl, {timeout: 5000});
+    let d = await res.json();
+    if(d.data?.length > 0) {
+      const price = d.data[0]?.close;
+      if(price) return parseFloat(price);
+    }
+  } catch(e) {
+    console.debug(`Finmind查詢失敗 ${code}:`, e.message);
+  }
+  
   return null;
 }
 
@@ -1403,6 +1441,15 @@ function clearCache() {
   showToast('快取已清除','ok');
 }
 
+function clearAllStocks() {
+  if(!confirm('確定刪除全部股票數據？此操作無法撤銷，刪除後需重新上傳。')) return;
+  STOCKS_RAW.length = 0;
+  livePrices = {};
+  buildCatTabs();
+  renderPerf();
+  showToast('所有股票數據已刪除，請上傳新的股票數據','ok');
+}
+
 async function testGAS() {
   gasUrl = document.getElementById('gasUrl').value.trim();
   if(!gasUrl) { showToast('請先輸入GAS URL','fail'); return; }
@@ -1448,21 +1495,8 @@ async function saveTodayPricesToGAS(stocks, date) {
 }
 
 async function loadStocksFromGAS(silent=false) {
-  if(!gasUrl) { if(!silent) showToast('請先設定GAS URL','fail'); return; }
-  if(!silent) showLoading('從GAS載入股票數據...');
-  try {
-    const r = await fetch(gasUrl+'?action=getStocks',{method:'GET',mode:'cors',cache:'no-cache',credentials:'omit',headers:{'Accept':'application/json'}});
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-    if(d.error) throw new Error(d.error);
-    if(d.data&&d.data.length>0) {
-      STOCKS_RAW.length=0; d.data.forEach(item=>STOCKS_RAW.push(item));
-      STOCKS_RAW.forEach(s=>{livePrices[s['代號']]=s['現價'];});
-      buildCatTabs(); renderPerf();
-      if(!silent) showToast('載入 '+STOCKS_RAW.length+' 檔股票數據','ok');
-    }
-  } catch(e) { if(!silent) showToast('載入失敗: '+e.message,'fail'); }
-  finally { if(!silent) hideLoading(); }
+  // 已改為本地上傳，不從GAS載入
+  if(!silent) showToast('股票數據已改為本地上傳，請使用「上傳股票數據檔案」功能','info');
 }
 
 async function loadLedgerFromGAS(silent=false) {
@@ -1494,23 +1528,26 @@ async function uploadDataFile() {
   const fi = document.getElementById('dataFile');
   const sd = document.getElementById('uploadStatus');
   if(!fi.files.length) { sd.textContent='請選擇檔案'; sd.style.color='var(--red)'; return; }
-  if(!gasUrl) { sd.textContent='請先設定GAS URL'; sd.style.color='var(--red)'; return; }
   const file = fi.files[0];
   sd.textContent='正在讀取檔案...'; sd.style.color='var(--text2)';
   try {
     const rawRows = await parseUploadedFile(file);
     const data = normalizeUploadRows(rawRows);
     if(!data.length) throw new Error('解析後沒有可用資料');
-    sd.textContent='正在更新到試算表...';
-    const r = await fetch(gasUrl,{method:'POST',mode:'cors',cache:'no-cache',credentials:'omit',body:JSON.stringify({action:'uploadData',data})});
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const result = await r.json();
-    if(result.error) throw new Error(result.error);
-    sd.textContent=`成功更新 ${result.count||0} 筆資料`;
+    
+    // 只在本地HTML中存儲，不上傳到GAS
+    STOCKS_RAW.length = 0;
+    data.forEach(item => STOCKS_RAW.push(item));
+    STOCKS_RAW.forEach(s => { livePrices[s['代號']] = s['現價']; });
+    
+    sd.textContent=`成功載入 ${data.length} 檔股票`;
     sd.style.color='var(--green)';
-    showToast('資料已更新','ok');
-    // 上傳成功後自動從GAS載入最新的股票數據
-    setTimeout(() => loadStocksFromGAS(true), 500);
+    showToast('股票數據已載入本地','ok');
+    buildCatTabs();
+    renderPerf();
+    
+    // 清空檔案輸入框
+    fi.value = '';
   } catch(e) { sd.textContent='上傳失敗: '+e.message; sd.style.color='var(--red)'; }
 }
 
@@ -1577,6 +1614,7 @@ function normalizeUploadRows(rows) {
 // ============================================================
 function renderGASCode() {
   document.getElementById('gasCode').value = `// ====== 台股績效系統 GAS 後端 ======
+// GAS只負責管理帳務本和績效
 const LEDGER_SHEET = '帳務本';
 const PRICES_SHEET = '每日現價';
 
@@ -1584,7 +1622,6 @@ function doGet(e) {
   const a = e.parameter.action;
   if (a === 'ping') return json({status:'ok', time: new Date().toISOString()});
   if (a === 'getLedger') return json({data: readLedger()});
-  if (a === 'getStocks') return json({data: readStocks()});
   if (a === 'getPrices') return json({data: readPrices(e.parameter.date)});
   return json({error:'unknown action'});
 }
@@ -1594,7 +1631,6 @@ function doPost(e) {
     const b = JSON.parse(e.postData.contents);
     if (b.action === 'saveLedger') { writeLedger(b.data); return json({status:'ok', count: b.data.length}); }
     if (b.action === 'savePrices') { writePrices(b.data, b.date); return json({status:'ok'}); }
-    if (b.action === 'uploadData') { return uploadDataToSheets(b.data); }
     return json({error:'unknown action'});
   } catch(err) {
     return json({error: err.message, status: 'error'});
@@ -1603,18 +1639,6 @@ function doPost(e) {
 
 function json(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
-
-function uploadDataToSheets(data) {
-  try {
-    const s = getSheet('股票數據', ['代號','名稱','分類','現價','漲幅','貝氏評分']);
-    s.clearContents();
-    s.appendRow(['代號','名稱','分類','現價','漲幅','貝氏評分']);
-    data.forEach(stock => s.appendRow([stock['代號'], stock['名稱'], stock['分類'], stock['現價'], stock['漲幅'], stock['貝氏評分']]));
-    return json({status:'ok', count: data.length});
-  } catch(err) {
-    return json({status:'error', error: err.message});
-  }
 }
 
 function getSheet(name, headers) {
@@ -1632,13 +1656,6 @@ function readLedger() {
     ledgerDate: String(r[0]), date: fmtDate(r[1]), code: String(r[2]), name: r[3], cat: r[4],
     buyPrice: Number(r[5]), shares: Number(r[6]), score: Number(r[7])
   }));
-}
-
-function readStocks() {
-  const s = getSheet('股票數據', ['代號','名稱','分類','現價','漲幅','貝氏評分']);
-  const rows = s.getDataRange().getValues();
-  if (rows.length <= 1) return [];
-  return rows.slice(1).map(r => ({'代號': String(r[0]), '名稱': r[1], '分類': r[2], '現價': Number(r[3]), '漲幅': r[4]?Number(r[4]):null, '貝氏評分': Number(r[5])}));
 }
 
 function writeLedger(data) {
